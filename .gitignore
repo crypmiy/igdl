@@ -1,0 +1,6 @@
+venv/
+data/
+.env
+cookies.txt
+__pycache__/
+*.egg-info/

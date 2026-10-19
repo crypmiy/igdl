@@ -1,0 +1,19 @@
+[Unit]
+Description=igdl — Instagram downloader Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@DIR@
+EnvironmentFile=@DIR@/.env
+Environment=IGDL_HOME=@DIR@
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@DIR@/venv/bin/igdl-bot
+Restart=on-failure
+RestartSec=10
+Nice=5
+
+[Install]
+WantedBy=multi-user.target
