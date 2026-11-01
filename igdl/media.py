@@ -98,15 +98,20 @@ def fit_video(src: Path, limit: int = TG_VIDEO_LIMIT, cb: Progress = lambda *a: 
         raise RuntimeError(f"video terlalu panjang ({info.duration/60:.0f} menit) "
                            "untuk dimuat di bawah 50 MB")
     dst = src.with_name(src.stem + "_tg.mp4")
+    if dst.exists() and 0 < dst.stat().st_size <= limit:      # compressed earlier
+        cb("kompres", 100.0, f"{dst.stat().st_size/MB:.1f} MB (dari disk)")
+        return dst
+    tmp = src.with_name(src.stem + "_tg.part.mp4")
     for attempt in range(3):
         label = f"{src.stat().st_size/MB:.0f} MB → <{limit/MB:.0f} MB, {vkbps} kbps"
         if attempt:
             label += f" (ulang #{attempt})"
-        _encode(src, dst, info, vkbps, cb, label)
-        if dst.stat().st_size <= limit:
+        _encode(src, tmp, info, vkbps, cb, label)
+        if tmp.stat().st_size <= limit:
+            tmp.rename(dst)
             cb("kompres", 100.0, f"{dst.stat().st_size/MB:.1f} MB")
             return dst
-        vkbps = int(vkbps * 0.8 * limit / dst.stat().st_size)
+        vkbps = int(vkbps * 0.8 * limit / tmp.stat().st_size)
     raise RuntimeError("kompresi tidak berhasil masuk batas 50 MB")
 
 
@@ -116,10 +121,14 @@ def normalise_photo(src: Path) -> Path:
     if ext in (".jpg", ".jpeg", ".png") and src.stat().st_size <= TG_PHOTO_LIMIT:
         return src
     dst = src.with_name(src.stem + "_tg.jpg")
+    if dst.exists() and dst.stat().st_size > 0:
+        return dst
+    tmp = src.with_name(src.stem + "_tg.part.jpg")
     vf = "scale='min(2560,iw)':-2" if src.stat().st_size > TG_PHOTO_LIMIT else "null"
     subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                    "-i", str(src), "-vf", vf, "-q:v", "3", "-frames:v", "1", str(dst)],
+                    "-i", str(src), "-vf", vf, "-q:v", "3", "-frames:v", "1", str(tmp)],
                    check=True, timeout=60)
+    tmp.rename(dst)
     return dst
 
 

@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import shutil
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -70,16 +69,17 @@ def main(argv=None) -> int:
         prefix = f"[{i}/{len(urls)}]"
         bar = Bar(prefix)
         t = classify(url)
-        tmp = Path(tempfile.mkdtemp(prefix="igdl_"))
         try:
-            files, method = download(t, tmp, bar)
+            files, method = download(t, None, bar)
             saved = []
             for f in files:
                 if a.fit and is_video(f):
                     f = fit_video(f, int(a.fit * MB), bar)
-                name = f"{t.code}_{f.name.replace('_tg.', '.')}" if t.code else f.name
+                name = f.name.replace("_tg.", ".")
+                if t.code and t.code not in name:
+                    name = f"{t.code}_{name}"
                 dst = out / name
-                shutil.move(str(f), dst)
+                shutil.copy2(f, dst)
                 saved.append(dst)
             size = sum(p.stat().st_size for p in saved) / MB
             bar.done(f"{prefix} ✓ {t.code or url}: {len(saved)} file, {size:.1f} MB "
@@ -93,8 +93,6 @@ def main(argv=None) -> int:
         except Exception as e:
             bar.done(f"{prefix} ✗ {url}\n    {type(e).__name__}: {e}")
             fail += 1
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
     if len(urls) > 1:
         sys.stderr.write(f"Selesai: {ok} berhasil, {fail} gagal, "
                          f"{time.monotonic() - t_all:.0f}s → {out}\n")

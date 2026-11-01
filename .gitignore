@@ -4,3 +4,5 @@ data/
 cookies.txt
 __pycache__/
 *.egg-info/
+build/
+dist/

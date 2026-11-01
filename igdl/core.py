@@ -1,7 +1,9 @@
 """Instagram media fetcher (no login).
 
-Chain: gallery-dl -> yt-dlp -> embed page.  Each stage stops at the first
-one that produces files.  A progress callback receives (stage, pct, detail).
+Chain: graphql (logged-out web query) -> gallery-dl -> yt-dlp -> embed page.
+The first stage that produces files wins.  Results are cached on disk under
+$IGDL_HOME/data/media/<shortcode>/ and reused.  A progress callback receives
+(stage, pct, detail).
 """
 from __future__ import annotations
 
@@ -34,8 +36,10 @@ NET_HINTS = ("tunnel connection failed", "unable to connect", "name resolution",
              "name or service not known", "timed out", "network is unreachable",
              "connection refused", "connection reset", "no route to host",
              "proxyerror", "connectionerror")
-LOGIN_HINTS = ("login", "log in", "401", "403", "429", "rate", "checkpoint",
-               "redirect", "private", "not available", "unavailable")
+RATE_HINTS = ("429", "rate-limit", "rate limit", "halaman login", "redirect")
+
+BASE = Path(os.environ.get("IGDL_HOME", Path(__file__).resolve().parents[1]))
+MEDIA_CACHE = BASE / "data" / "media"
 
 
 def _noop(stage: str, pct: Optional[float], detail: str) -> None:
@@ -108,7 +112,9 @@ def classify(url: str) -> Target:
 
 def _media_files(d: Path) -> list[Path]:
     files = [f for f in d.iterdir()
-             if f.is_file() and f.suffix.lower() in MEDIA_EXT and f.stat().st_size > 0]
+             if f.is_file() and f.suffix.lower() in MEDIA_EXT and f.stat().st_size > 0
+             and not f.stem.endswith("_tg")           # _tg = our Telegram-ready copies
+             and ".part" not in f.name]
     return sorted(files, key=lambda f: f.name)
 
 
@@ -191,11 +197,19 @@ def _via_yt_dlp(t: Target, dest: Path, cb: Progress) -> list[Path]:
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([t.url])
     except Exception as e:  # yt_dlp.utils.DownloadError and friends
-        raise RuntimeError(str(e)[-400:])
+        raise RuntimeError(str(e)[:400])
     files = _media_files(dest)
     if not files:
-        raise RuntimeError("yt-dlp: tidak ada file")
+        raise RuntimeError("tidak ada file")
     return files
+
+
+# ---------------------------------------------------------------- graphql
+def _via_graphql(t: Target, dest: Path, cb: Progress) -> list[Path]:
+    from . import graphql
+    if not t.code:
+        raise RuntimeError("butuh shortcode")
+    return graphql.download(t.code, dest, cb)
 
 
 # ---------------------------------------------------------------- embed page
@@ -247,14 +261,14 @@ def _embed_items(page: str) -> list[tuple[str, str]]:
 
 def _via_embed(t: Target, dest: Path, cb: Progress) -> list[Path]:
     if not t.code:
-        raise RuntimeError("embed: butuh shortcode")
+        raise RuntimeError("butuh shortcode")
     cb("embed", None, "membaca halaman embed")
     base = "p" if t.kind == "post" else "reel"
     page = _http_get(f"https://www.instagram.com/{base}/{t.code}/embed/captioned/").decode(
         "utf-8", "replace")
     items = _embed_items(page)
     if not items:
-        raise RuntimeError("embed: media tidak ditemukan")
+        raise RuntimeError("media tidak ditemukan di halaman embed")
     for i, (u, ext) in enumerate(items, 1):
         cb("embed", 100.0 * (i - 1) / len(items), f"file {i}/{len(items)}")
         (dest / f"{i:02d}_{t.code}{ext}").write_bytes(_http_get(u, timeout=60))
@@ -272,14 +286,46 @@ def precheck(t: Target) -> Optional[str]:
     return None
 
 
-def download(t: Target, dest: Path, cb: Progress = _noop) -> tuple[list[Path], str]:
-    """Download all media of a post/reel into dest. Returns (files, method)."""
+def cache_dir(t: Target) -> Path:
+    return MEDIA_CACHE / (t.code or re.sub(r"[^A-Za-z0-9_-]+", "_", t.url)[-80:])
+
+
+def _short(msg: str) -> str:
+    """One readable line per stage."""
+    low = msg.lower()
+    if "no video formats" in low or "there is no video" in low:
+        return "post berisi foto (yt-dlp hanya untuk video)"
+    if "redirect to login" in low or "dialihkan ke halaman login" in low:
+        return "dialihkan ke halaman login"
+    lines = [ln.strip() for ln in msg.splitlines() if ln.strip()]
+    line = next((ln for ln in reversed(lines) if "error" in ln.lower()), lines[-1] if lines else msg)
+    line = re.sub(r"^(\[[^\]]+\]\[error\]|ERROR:|\w+\.\w+\.\w+:)\s*", "", line)
+    line = line.split("; please report")[0].split(" (caused by")[0]
+    line = re.sub(r"^\[\w+\] [\w-]+: ", "", line)
+    return line[:160]
+
+
+STAGES = (("graphql", _via_graphql), ("gallery-dl", _via_gallery_dl),
+          ("yt-dlp", _via_yt_dlp), ("embed", _via_embed))
+
+
+def download(t: Target, dest: Optional[Path] = None,
+             cb: Progress = _noop) -> tuple[list[Path], str]:
+    """Download all media of a post/reel. Returns (files, method).
+
+    dest defaults to the on-disk cache; a completed download (marked by .done)
+    is reused instead of fetched again."""
     if reason := precheck(t):
         raise IGError(reason)
+    dest = dest or cache_dir(t)
     dest.mkdir(parents=True, exist_ok=True)
-    errors = []
-    for name, fn in (("gallery-dl", _via_gallery_dl), ("yt-dlp", _via_yt_dlp),
-                     ("embed", _via_embed)):
+    done = dest / ".done"
+    if done.exists() and (files := _media_files(dest)):
+        cb("cache", 100.0, f"{len(files)} file dari disk")
+        return files, "cache"
+    errors: list[tuple[str, str]] = []
+    gated = False
+    for name, fn in STAGES:
         for f in dest.iterdir():          # clean leftovers from a failed stage
             if f.is_file():
                 f.unlink()
@@ -288,18 +334,21 @@ def download(t: Target, dest: Path, cb: Progress = _noop) -> tuple[list[Path], s
         try:
             files = fn(t, dest, cb)
             if files:
+                done.write_text(name)
                 return files, name
         except Exception as e:
-            errors.append(f"{name}: {e}")
-    blob = " ".join(errors).lower()
-    if all(any(h in e.lower() for h in NET_HINTS) for e in errors):
-        raise IGError("Jetson tidak bisa menghubungi Instagram (masalah jaringan/DNS). "
-                      "Cek koneksi lalu coba lagi.\n\nDetail: " + errors[-1][:300])
-    if any(h in blob for h in LOGIN_HINTS):
-        raise IGError("Instagram menolak akses tanpa login (post private, dihapus, "
-                      "atau sedang rate-limit). Coba lagi beberapa menit lagi.\n\n"
-                      "Detail: " + errors[-1][:300])
-    raise IGError("Gagal mengunduh.\n\nDetail: " + " | ".join(e[:200] for e in errors))
+            gated = gated or type(e).__name__ == "GatedError"
+            errors.append((name, str(e) or type(e).__name__))
+    detail = "\n".join(f"• {n}: {_short(m)}" for n, m in errors)
+    if all(any(h in m.lower() for h in NET_HINTS) for _, m in errors):
+        head = "Jetson tidak bisa menghubungi Instagram (jaringan/DNS). Cek koneksi lalu coba lagi."
+    elif gated:
+        head = "Post ini tidak bisa dibuka tanpa login (private, dibatasi umur, atau dihapus)."
+    elif any(h in m.lower() for _, m in errors for h in RATE_HINTS):
+        head = "Instagram sedang membatasi akses tanpa login dari IP ini. Coba lagi beberapa menit lagi."
+    else:
+        head = "Gagal mengunduh."
+    raise IGError(f"{head}\n\n{detail}")
 
 
 def is_video(p: Path) -> bool:

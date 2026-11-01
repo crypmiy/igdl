@@ -7,7 +7,6 @@ import logging
 import os
 import shutil
 import sqlite3
-import tempfile
 import time
 from contextlib import ExitStack
 from pathlib import Path
@@ -35,7 +34,8 @@ EDIT_EVERY = 2.0          # seconds between progress edits (Telegram flood limit
 HELP = ("Kirim link Instagram, nanti saya balas dengan foto/videonya.\n\n"
         "Didukung (tanpa login): post foto, carousel, reel, video.\n"
         "Tidak didukung: story, highlight, profil (butuh login).\n"
-        "Video > 50 MB dikompres otomatis.")
+        "Video > 50 MB dikompres otomatis.\n"
+        "Hasil unduhan disimpan di disk, link yang sama tidak diunduh ulang.")
 
 
 # ------------------------------------------------------------------ cache
@@ -232,11 +232,10 @@ async def process(ctx: ContextTypes.DEFAULT_TYPE, msg: Message, url: str):
         f"🔗 {t.code or url}\n⏳ antre…" if sem.locked() else f"🔗 {t.code or url}\n⏳ mulai…",
         link_preview_options=NO_PREVIEW)
     st = Status(status_msg, f"🔗 {t.code or url}")
-    tmp = Path(tempfile.mkdtemp(prefix="igdl_"))
     async with sem:
         st.start()
         try:
-            files, method = await asyncio.to_thread(download, t, tmp, st.update)
+            files, method = await asyncio.to_thread(download, t, None, st.update)
             ready = await asyncio.to_thread(_prepare, files, st)
             total = sum(p.stat().st_size for _, p, _ in ready) / MB
             st.update("mengirim ke Telegram", None, f"{len(ready)} file, {total:.1f} MB")
@@ -260,8 +259,6 @@ async def process(ctx: ContextTypes.DEFAULT_TYPE, msg: Message, url: str):
             st.stop()
             log.exception("gagal %s", url)
             await st.flush(f"❌ Error: {type(e).__name__}: {str(e)[:300]}")
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ------------------------------------------------------------------ main
