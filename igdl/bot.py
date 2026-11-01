@@ -19,7 +19,11 @@ from telegram.ext import (Application, CommandHandler, ContextTypes, MessageHand
                           filters)
 
 from . import __version__
-from .core import IGError, Target, classify, download, find_urls, is_video, precheck
+import re
+
+from . import profile as prof
+from .core import (IGError, Target, classify, download, find_profiles, find_urls, is_video,
+                   precheck)
 from .media import MB, TG_PHOTO_LIMIT, TG_VIDEO_LIMIT, fit_video, normalise_photo, video_meta
 
 log = logging.getLogger("igdl")
@@ -28,12 +32,16 @@ BASE = Path(os.environ.get("IGDL_HOME", Path(__file__).resolve().parents[1]))
 DATA = BASE / "data"
 ALLOWED = {int(x) for x in os.environ.get("ALLOWED_CHAT_IDS", "").replace(" ", "").split(",") if x}
 MAX_JOBS = int(os.environ.get("MAX_JOBS", "1"))
+PROFILE_N = int(os.environ.get("PROFILE_N", "12"))
+PROFILE_MAX = 50
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 EDIT_EVERY = 2.0          # seconds between progress edits (Telegram flood limits)
 
 HELP = ("Kirim link Instagram, nanti saya balas dengan foto/videonya.\n\n"
         "Didukung (tanpa login): post foto, carousel, reel, video.\n"
-        "Tidak didukung: story, highlight, profil (butuh login).\n"
+        "Akun: kirim @username atau link profil → post terbaru "
+        f"(default {PROFILE_N}; mis. \"@natgeo 5\").\n"
+        "Tidak didukung: story, highlight (butuh login).\n"
         "Video > 50 MB dikompres otomatis.\n"
         "Hasil unduhan disimpan di disk, link yang sama tidak diunduh ulang.")
 
@@ -97,7 +105,7 @@ class Status:
             await self.msg.edit_text(txt, link_preview_options=NO_PREVIEW)
             self.shown = txt
         except RetryAfter as e:
-            await asyncio.sleep(e.retry_after)
+            await asyncio.sleep(_secs(e.retry_after))
         except BadRequest:
             pass
 
@@ -110,6 +118,22 @@ class Status:
 
 
 # ------------------------------------------------------------------ sending
+def _secs(ra) -> float:
+    return ra.total_seconds() if hasattr(ra, "total_seconds") else float(ra)
+
+
+async def _send_safe(bot, chat_id: int, reply_to: int, items, caption: str):
+    """_send with Telegram flood-control retries."""
+    for _ in range(4):
+        try:
+            return await _send(bot, chat_id, reply_to, items, caption)
+        except RetryAfter as e:
+            log.info("flood control: tunggu %.0fs", _secs(e.retry_after))
+            await asyncio.sleep(_secs(e.retry_after) + 1)
+            for _, media, _ in items:                    # rewind open files
+                if hasattr(media, "seek"):
+                    media.seek(0)
+    return await _send(bot, chat_id, reply_to, items, caption)
 def _file_id(m: Message) -> tuple[str, str]:
     if m.video:
         return "video", m.video.file_id
@@ -207,11 +231,21 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _allowed(update):
         return await _deny(update)
     msg = update.effective_message
-    urls = find_urls(msg.text or msg.caption or "")
-    if not urls:
+    text = msg.text or msg.caption or ""
+    urls = find_urls(text)
+    users = find_profiles(text)
+    if not urls and not users:
         return await msg.reply_text(HELP)
+    m = re.search(r"\b(\d{1,3})\b", re.sub(r"https?://\S+|@\S+", " ", text))
+    n = min(int(m.group(1)), PROFILE_MAX) if m else PROFILE_N
     for url in urls:
-        await process(ctx, msg, url)
+        t = await asyncio.to_thread(classify, url)
+        if t.kind == "profile":
+            users.append(t.code)
+        else:
+            await process(ctx, msg, url)
+    for u in dict.fromkeys(users):
+        await process_profile(ctx, msg, u, max(1, n))
 
 
 async def process(ctx: ContextTypes.DEFAULT_TYPE, msg: Message, url: str):
@@ -227,7 +261,7 @@ async def process(ctx: ContextTypes.DEFAULT_TYPE, msg: Message, url: str):
     if cached := cache.get(t.key):
         try:
             items = [(k, fid, {}) for k, fid in cached]
-            await _send(ctx.bot, msg.chat_id, msg.message_id, items, caption + "  ⚡")
+            await _send_safe(ctx.bot, msg.chat_id, msg.message_id, items, caption + "  ⚡")
             return
         except BadRequest:
             cache.drop(t.key)          # stale file_id → download again
@@ -247,7 +281,7 @@ async def process(ctx: ContextTypes.DEFAULT_TYPE, msg: Message, url: str):
             await ctx.bot.send_chat_action(msg.chat_id, ChatAction.UPLOAD_DOCUMENT)
             with ExitStack() as stack:
                 items = [(k, stack.enter_context(open(p, "rb")), meta) for k, p, meta in ready]
-                sent = await _send(ctx.bot, msg.chat_id, msg.message_id, items, caption)
+                sent = await _send_safe(ctx.bot, msg.chat_id, msg.message_id, items, caption)
             cache.put(t.key, sent)
             st.stop()
             el = time.monotonic() - st.t0
@@ -263,6 +297,88 @@ async def process(ctx: ContextTypes.DEFAULT_TYPE, msg: Message, url: str):
             st.stop()
             log.exception("gagal %s", url)
             await st.flush(f"❌ Error: {type(e).__name__}: {str(e)[:300]}")
+
+
+async def _deliver(ctx, chat_id: int, reply_to: int, key: str, files, caption: str,
+                   st: "Status") -> tuple[int, bool]:
+    """Send one post (file_id cache first). Returns (n_sent, from_cache)."""
+    cache: Cache = ctx.application.bot_data["cache"]
+    if cached := cache.get(key):
+        try:
+            await _send_safe(ctx.bot, chat_id, reply_to,
+                             [(k, fid, {}) for k, fid in cached], caption + "  ⚡")
+            return len(cached), True
+        except BadRequest:
+            cache.drop(key)
+    ready = await asyncio.to_thread(_prepare, files, st)
+    with ExitStack() as stack:
+        items = [(k, stack.enter_context(open(p, "rb")), meta) for k, p, meta in ready]
+        sent = await _send_safe(ctx.bot, chat_id, reply_to, items, caption)
+    cache.put(key, sent)
+    return len(sent), False
+
+
+async def process_profile(ctx: ContextTypes.DEFAULT_TYPE, msg: Message, username: str, n: int):
+    """Latest n posts of an account, no login. Downloads run ahead while sending."""
+    sem: asyncio.Semaphore = ctx.application.bot_data["sem"]
+    title = f"👤 @{username} · {n} post terbaru"
+    status_msg = await msg.reply_text(f"{title}\n⏳ {'antre…' if sem.locked() else 'mulai…'}",
+                                      link_preview_options=NO_PREVIEW)
+    st = Status(status_msg, title)
+    loop = asyncio.get_running_loop()
+    q: asyncio.Queue = asyncio.Queue()
+    done = object()
+
+    def on_post(i, total, r):
+        loop.call_soon_threadsafe(q.put_nowait, (i, total, r))
+
+    def note(m):
+        st.update("info", None, m)
+
+    async with sem:
+        st.start()
+        st.update("membaca daftar post", None, f"@{username}")
+        job = loop.run_in_executor(None, lambda: prof.run(username, n, False, on_post, note))
+        job.add_done_callback(lambda _: loop.call_soon_threadsafe(q.put_nowait, done))
+        sent_posts = from_cache = failed = files_total = 0
+        errors: list[str] = []
+        while (item := await q.get()) is not done:
+            i, total, r = item
+            st.update(f"post {i}/{total or n}", 100.0 * (i - 1) / (total or n), r.code)
+            if r.error:
+                failed += 1
+                errors.append(f"{r.code}: {r.error}")
+                continue
+            try:
+                cap = f"📥 {i}/{total or n} · @{username}\nhttps://www.instagram.com/p/{r.code}/"
+                k, cached = await _deliver(ctx, msg.chat_id, msg.message_id, f"post:{r.code}",
+                                           r.files, cap, st)
+                sent_posts += 1
+                files_total += k
+                from_cache += cached
+            except Exception as e:
+                failed += 1
+                log.exception("kirim %s gagal", r.code)
+                errors.append(f"{r.code}: {type(e).__name__}: {str(e)[:120]}")
+            await asyncio.sleep(1.0)                      # stay under Telegram flood limits
+        st.stop()
+        try:
+            await job
+        except IGError as e:
+            return await st.flush(f"❌ {e}")
+        except Exception as e:
+            log.exception("profil %s gagal", username)
+            return await st.flush(f"❌ Error: {type(e).__name__}: {str(e)[:300]}")
+        el = time.monotonic() - st.t0
+        summary = (f"✅ {sent_posts} post · {files_total} file"
+                   + (f" · {from_cache} dari cache" if from_cache else "")
+                   + (f" · {failed} gagal" if failed else "") + f" · {el:.0f}s")
+        if errors:
+            summary += "\n" + "\n".join(f"• {e}" for e in errors[:5])
+        if n > prof.ANON_PAGE and sent_posts <= prof.ANON_PAGE and not prof.cookies_file():
+            summary += (f"\nℹ️ Tanpa login Instagram biasanya hanya memberi ±{prof.ANON_PAGE} "
+                        "post terbaru. Untuk semua post: igdl @akun --all (CLI, butuh cookies).")
+        await st.flush(summary)
 
 
 # ------------------------------------------------------------------ main

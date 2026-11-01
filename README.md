@@ -7,7 +7,8 @@ Dibuat untuk berjalan di server kecil (dikembangkan di Jetson Orin Nano, aarch64
 ## Fitur
 
 - **Post foto, carousel, reel, dan video** — semua item carousel diunduh berurutan.
-- **Tanpa login.** Story, highlight, dan halaman profil ditolak dengan pesan yang jelas karena Instagram mewajibkan login untuk itu.
+- **Per akun.** `@username` atau link profil → post terbaru tanpa login (±12, batas Instagram untuk pengunjung tanpa akun). Riwayat lengkap (post + reels) lewat CLI `--all` dengan cookies akun cadangan.
+- **Tanpa login untuk semua yang lain.** Story dan highlight ditolak dengan pesan yang jelas karena Instagram mewajibkan login untuk itu.
 - **Empat jalur unduh berlapis**: GraphQL tanpa login → `gallery-dl` → `yt-dlp` → halaman embed. Kalau satu gagal, jalur berikutnya dicoba otomatis.
 - **Cache di disk**: hasil unduhan disimpan di `data/media/<shortcode>/` dan dipakai ulang; link yang sama tidak diunduh lagi.
 - **Bot Telegram**
@@ -64,6 +65,36 @@ igdl -i links.txt                                      # daftar link dari file
 igdl -i links.txt --fit 49                             # kompres video > 49 MB
 ```
 
+### Per akun
+
+```bash
+igdl @natgeo                       # 12 post terbaru, tanpa login → ~/Downloads/igdl/natgeo/
+igdl @natgeo -n 5                  # 5 post terbaru
+igdl https://www.instagram.com/natgeo/
+igdl @natgeo --all                 # semua post + reels (butuh IG_COOKIES, lihat di bawah)
+```
+
+- Progres per post: `[37/412] ✓ KODE: 3 file via graphql · ETA 41m`.
+- **Tahan putus:** Ctrl+C atau koneksi terputus tidak masalah — jalankan perintah yang sama dan
+  post yang sudah selesai diambil dari cache, tidak diunduh ulang.
+- Kena rate-limit → jeda 90 detik lalu coba lagi; 5 post gagal berturut-turut → berhenti dengan
+  pesan "jalankan lagi nanti".
+- Daftar post yang pernah terlihat per akun disimpan di `data/profiles/<akun>.jsonl`.
+
+#### `--all` (riwayat lengkap)
+
+Tanpa login, Instagram hanya memperlihatkan satu halaman (±12 post) per profil. Untuk riwayat
+lengkap, igdl memakai cookies **akun cadangan** — jangan akun utama, akun yang dipakai scraping
+bisa di-suspend.
+
+1. Login ke akun cadangan di browser, ekspor cookies `instagram.com` ke `cookies.txt`
+   (format Netscape, mis. ekstensi "Get cookies.txt LOCALLY").
+2. Simpan sebagai `~/igdl/cookies.txt` (`chmod 600`), lalu isi `IG_COOKIES=/home/jetson/igdl/cookies.txt` di `.env`.
+
+Akun itu **hanya dipakai untuk mendaftar** post (tab posts lalu reels, dengan jeda 3–8 detik per
+request). Medianya tetap diunduh lewat jalur GraphQL tanpa login. Akun dengan ribuan post butuh
+beberapa jam — jedanya disengaja.
+
 CLI menyimpan kualitas asli; kompresi hanya dilakukan bila diberi `--fit`. Path file hasil dicetak ke stdout, progres ke stderr, jadi aman dipakai di skrip.
 
 ## Pemakaian bot Telegram
@@ -80,6 +111,11 @@ CLI menyimpan kualitas asli; kompresi hanya dilakukan bila diberi `--fit`. Path 
 
 Setelah itu cukup paste satu atau beberapa link Instagram dalam satu pesan.
 
+**Per akun di bot:** kirim `@natgeo` atau link profil → bot mengirim post terbaru satu per satu
+(default 12, ubah lewat angka: `@natgeo 5`, maks. 50). Unduhan post berikutnya berjalan sambil
+post sebelumnya dikirim, dan bot otomatis menunggu bila kena batas flood Telegram. Riwayat
+lengkap sengaja hanya lewat CLI.
+
 ## Konfigurasi (`.env`)
 
 | Variabel | Default | Keterangan |
@@ -87,7 +123,8 @@ Setelah itu cukup paste satu atau beberapa link Instagram dalam satu pesan.
 | `BOT_TOKEN` | — | Token dari @BotFather (wajib untuk bot). |
 | `ALLOWED_CHAT_IDS` | kosong | Chat ID yang boleh memakai bot, dipisah koma. **Kosong = terbuka untuk semua orang.** |
 | `MAX_JOBS` | `1` | Jumlah unduhan paralel. Kompresi memakai CPU, jadi 1 sudah cukup di perangkat kecil. |
-| `IG_COOKIES` | kosong | Opsional: path `cookies.txt` (format Netscape). Kosong = tanpa login. |
+| `PROFILE_N` | `12` | Jumlah post terbaru yang dikirim bot untuk `@akun`. |
+| `IG_COOKIES` | kosong | Opsional: path `cookies.txt` akun cadangan (format Netscape). Dipakai untuk `igdl @akun --all` dan sebagai cadangan gallery-dl. Kosong = tanpa login. |
 
 ## Cara kerja jalur GraphQL
 
@@ -123,6 +160,7 @@ cd ~/igdl && git pull && ./install.sh
 ## Batasan
 
 - Hanya konten **publik**. Akun private, story, dan highlight tidak didukung tanpa login.
+- Tanpa login, per akun hanya ±12 post terbaru. Reels yang tidak tampil di grid profil hanya ikut dengan `--all`.
 - Instagram membatasi akses tanpa login (rate-limit). Bila sering gagal, tunggu beberapa menit.
 - Kompresi memakai encoder software (libx264). Di perangkat tanpa encoder hardware, video panjang butuh waktu; progresnya tetap terlihat.
 - Batas Bot API Telegram: 50 MB per file, 10 item per album.
@@ -134,6 +172,7 @@ igdl/
 ├── igdl/
 │   ├── core.py      # klasifikasi link, cache, rantai unduh
 │   ├── graphql.py   # jalur GraphQL tanpa login (curl_cffi)
+│   ├── profile.py   # unduhan per akun (daftar post + unduh satu per satu)
 │   ├── media.py     # ffprobe/ffmpeg: kompres video, normalisasi foto
 │   ├── cli.py       # perintah `igdl`
 │   └── bot.py       # perintah `igdl-bot` (Telegram)

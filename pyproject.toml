@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "igdl"
-version = "1.1.1"
-description = "Instagram post/reel/carousel downloader — CLI + Telegram bot (no login)"
+version = "1.2.0"
+description = "Instagram post/reel/carousel/account downloader — CLI + Telegram bot (no login)"
 requires-python = ">=3.10"
 dependencies = [
   "gallery-dl>=1.30",

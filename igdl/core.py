@@ -36,6 +36,9 @@ NET_HINTS = ("tunnel connection failed", "unable to connect", "name resolution",
              "name or service not known", "timed out", "network is unreachable",
              "connection refused", "connection reset", "no route to host",
              "proxyerror", "connectionerror")
+USER_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
+RESERVED = {"explore", "accounts", "direct", "about", "legal", "developer", "web",
+            "api", "graphql", "p", "reel", "reels", "tv", "stories", "share", "s"}
 RATE_HINTS = ("429", "rate-limit", "rate limit", "halaman login", "redirect")
 
 BASE = Path(os.environ.get("IGDL_HOME", Path(__file__).resolve().parents[1]))
@@ -62,7 +65,7 @@ class Target:
 
     @property
     def needs_login(self) -> bool:
-        return self.kind in {"story", "highlight", "profile"}
+        return self.kind in {"story", "highlight"}
 
 
 def find_urls(text: str) -> list[str]:
@@ -105,9 +108,16 @@ def classify(url: str) -> Target:
             kind = "post" if seg in {"p", "tv"} else "reel"
             base = "p" if kind == "post" else "reel"
             return Target(f"https://www.instagram.com/{base}/{code}/", kind, code)
-    if len(parts) == 1 or parts[1] in {"reels", "tagged"}:
-        return Target(url, "profile")
+    if (len(parts) == 1 or parts[1] in {"reels", "tagged", "posts", "photos"}) \
+            and USER_RE.match(parts[0]) and parts[0].lower() not in RESERVED:
+        return Target(f"https://www.instagram.com/{parts[0]}/", "profile", parts[0])
     return Target(url, "unknown")
+
+
+def find_profiles(text: str) -> list[str]:
+    """@username mentions written as a whole word."""
+    return [m for m in re.findall(r"(?<![\w.@/])@([A-Za-z0-9._]{1,30})\b", text or "")
+            if m.lower() not in RESERVED]
 
 
 def _media_files(d: Path) -> list[Path]:
@@ -279,8 +289,10 @@ def _via_embed(t: Target, dest: Path, cb: Progress) -> list[Path]:
 def precheck(t: Target) -> Optional[str]:
     """Reason this link can't be handled without login, or None."""
     if t.needs_login:
-        return ("Story, highlight, dan halaman profil butuh login. "
-                "Kirim link post (/p/…) atau reel (/reel/…).")
+        return ("Story dan highlight butuh login. "
+                "Kirim link post (/p/…), reel (/reel/…), atau profil (@username).")
+    if t.kind == "profile":
+        return "Ini link profil — pakai unduhan per akun."
     if t.kind == "unknown":
         return "Link tidak dikenali sebagai post atau reel Instagram."
     return None
@@ -300,7 +312,7 @@ def _short(msg: str) -> str:
     lines = [ln.strip() for ln in msg.splitlines() if ln.strip()]
     line = next((ln for ln in reversed(lines) if "error" in ln.lower()), lines[-1] if lines else msg)
     line = re.sub(r"^(\[[^\]]+\]\[error\]|ERROR:|\w+\.\w+\.\w+:)\s*", "", line)
-    line = line.split("; please report")[0].split(" (caused by")[0]
+    line = line.split("; please report")[0].split(" (caused by")[0].split(". Please run")[0]
     line = re.sub(r"^\[\w+\] [\w-]+: ", "", line)
     return line[:160]
 
