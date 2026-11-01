@@ -176,9 +176,13 @@ def _prepare(files: list[Path], st: Status) -> list[tuple[str, Path, dict]]:
                           lambda s, p, d, tag=tag: st.update(f"kompres {tag}", p, d))
             out.append(("video", g, video_meta(g)))
         else:
-            g = normalise_photo(f)
-            out.append(("photo" if g.stat().st_size <= TG_PHOTO_LIMIT else "document",
-                        g, {}))
+            try:
+                g = normalise_photo(f)
+                kind = "photo" if g.stat().st_size <= TG_PHOTO_LIMIT else "document"
+            except Exception as e:                  # never lose the whole post over one slide
+                log.warning("foto %s dikirim sebagai file: %s", f.name, e)
+                g, kind = f, "document"
+            out.append((kind, g, {}))
     return out
 
 

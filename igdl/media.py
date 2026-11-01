@@ -115,21 +115,87 @@ def fit_video(src: Path, limit: int = TG_VIDEO_LIMIT, cb: Progress = lambda *a: 
     raise RuntimeError("kompresi tidak berhasil masuk batas 50 MB")
 
 
+PHOTO_MAX_SIDE = 2560
+
+
+def sniff(p: Path) -> str:
+    """Real format from magic bytes (Instagram file extensions can lie)."""
+    with open(p, "rb") as fh:
+        b = fh.read(32)
+    if b[:3] == b"\xff\xd8\xff":
+        return "jpeg"
+    if b[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if b[:4] == b"RIFF" and b[8:12] == b"WEBP":
+        return "webp"
+    if b[4:8] == b"ftyp":
+        return "heif/avif"
+    if b[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if b.lstrip()[:1] == b"<":
+        return "html"
+    return "unknown"
+
+
+def _tg_dims_ok(p: Path) -> bool:
+    """Telegram sendPhoto: width + height ≤ 10000 and aspect ratio ≤ 20."""
+    try:
+        from PIL import Image
+        with Image.open(p) as im:
+            w, h = im.size
+        return w + h <= 10000 and max(w, h) <= 20 * min(w, h)
+    except Exception:
+        return True
+
+
+def _via_pillow(src: Path, tmp: Path) -> None:
+    from PIL import Image, ImageOps
+    with Image.open(src) as im:
+        im.seek(0)                                  # animated webp/gif → first frame
+        im = ImageOps.exif_transpose(im)
+        if im.mode in ("RGBA", "LA", "P"):
+            im = im.convert("RGBA")
+            bg = Image.new("RGB", im.size, (255, 255, 255))
+            bg.paste(im, mask=im.split()[-1])
+            im = bg
+        else:
+            im = im.convert("RGB")
+        im.thumbnail((PHOTO_MAX_SIDE, PHOTO_MAX_SIDE))
+        im.save(tmp, "JPEG", quality=92, optimize=True)
+
+
+def _via_ffmpeg(src: Path, tmp: Path) -> None:
+    r = subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(src),
+                        "-vf", f"scale='min({PHOTO_MAX_SIDE},iw)':-2", "-frames:v", "1",
+                        "-update", "1", "-q:v", "2", "-f", "image2", "-c:v", "mjpeg", str(tmp)],
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
+        raise RuntimeError((r.stderr.strip().splitlines() or [f"exit {r.returncode}"])[-1][:200])
+
+
 def normalise_photo(src: Path) -> Path:
-    """Telegram-safe JPEG: convert webp/heic, shrink if > 10 MB."""
-    ext = src.suffix.lower()
-    if ext in (".jpg", ".jpeg", ".png") and src.stat().st_size <= TG_PHOTO_LIMIT:
+    """Telegram-safe JPEG (≤ 10 MB). Pillow first, ffmpeg as fallback.
+    Raises RuntimeError with the real format and both reasons if neither works."""
+    kind = sniff(src)
+    if kind == "html":
+        raise RuntimeError(f"{src.name} bukan gambar (Instagram mengirim halaman HTML)")
+    if kind in ("jpeg", "png") and src.stat().st_size <= TG_PHOTO_LIMIT \
+            and src.suffix.lower() in (".jpg", ".jpeg", ".png") and _tg_dims_ok(src):
         return src
     dst = src.with_name(src.stem + "_tg.jpg")
     if dst.exists() and dst.stat().st_size > 0:
         return dst
     tmp = src.with_name(src.stem + "_tg.part.jpg")
-    vf = "scale='min(2560,iw)':-2" if src.stat().st_size > TG_PHOTO_LIMIT else "null"
-    subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                    "-i", str(src), "-vf", vf, "-q:v", "3", "-frames:v", "1", str(tmp)],
-                   check=True, timeout=60)
-    tmp.rename(dst)
-    return dst
+    errs = []
+    for name, fn in (("pillow", _via_pillow), ("ffmpeg", _via_ffmpeg)):
+        try:
+            fn(src, tmp)
+            tmp.rename(dst)
+            return dst
+        except Exception as e:
+            errs.append(f"{name}: {e}")
+            tmp.unlink(missing_ok=True)
+    raise RuntimeError(f"konversi {src.name} (format {kind}) gagal — " + "; ".join(errs))
 
 
 def video_meta(p: Path) -> dict:

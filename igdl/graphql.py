@@ -201,6 +201,9 @@ def download(code: str, dest: Path, cb: Progress) -> list[Path]:
         try:
             if r.status_code != 200:
                 raise RuntimeError(f"HTTP {r.status_code} saat mengunduh file {i}/{n}")
+            ctype = (r.headers.get("content-type") or "").lower()
+            if ctype.startswith(("text/", "application/json")):
+                raise RuntimeError(f"CDN mengirim {ctype.split(';')[0]}, bukan media (file {i}/{n})")
             total = int(r.headers.get("content-length") or 0)
             got, last = 0, 0.0
             with open(part, "wb") as fh:
