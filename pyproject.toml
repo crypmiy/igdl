@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "igdl"
-version = "1.4.0"
+version = "1.4.1"
 description = "Instagram, Threads and YouTube downloader — CLI + Telegram bot (no login)"
 requires-python = ">=3.10"
 dependencies = [
@@ -12,6 +12,7 @@ dependencies = [
   "yt-dlp[default,curl-cffi]>=2025.1.1",
   "python-telegram-bot>=21.6,<23",
   "Pillow>=10",
+  "imageio-ffmpeg>=0.6",          # tested fallback ffmpeg (static) — see igdl/ff.py
 ]
 
 [project.scripts]

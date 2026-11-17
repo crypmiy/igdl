@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
+
+from . import ff
 
 Progress = Callable[[str, Optional[float], str], None]
 
@@ -25,9 +28,18 @@ class Info:
 
 
 def probe(p: Path) -> Info:
+    """ffprobe when a working one is available, else parse `ffmpeg -i` output."""
+    if probe_exe := ff.ffprobe():
+        try:
+            return _probe_json(probe_exe, p)
+        except (subprocess.SubprocessError, ValueError, OSError):
+            pass
+    return _probe_ffmpeg(p)
+
+
+def _probe_json(exe: str, p: Path) -> Info:
     out = subprocess.run(
-        ["ffprobe", "-v", "error", "-print_format", "json",
-         "-show_format", "-show_streams", str(p)],
+        [exe, "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(p)],
         capture_output=True, text=True, timeout=60, check=True).stdout
     j = json.loads(out)
     v = next((s for s in j.get("streams", []) if s.get("codec_type") == "video"), {})
@@ -40,6 +52,21 @@ def probe(p: Path) -> Info:
     if abs(rot) in (90, 270):
         w, h = h, w
     return Info(dur, w, h, a)
+
+
+def _probe_ffmpeg(p: Path) -> Info:
+    r = subprocess.run([ff.ffmpeg(), "-hide_banner", "-i", str(p)],
+                       capture_output=True, text=True, timeout=60)
+    t = r.stderr
+    dur = 0.0
+    if (m := re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", t)):
+        dur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    w = h = 0
+    if (m := re.search(r"Stream #[^\n]*Video:[^\n]*?\b(\d{2,5})x(\d{2,5})\b", t)):
+        w, h = int(m.group(1)), int(m.group(2))
+    if re.search(r"rotation of -?(90|270)", t) or re.search(r"displaymatrix: rotation of -?(90|270)", t):
+        w, h = h, w
+    return Info(dur, w, h, bool(re.search(r"Stream #[^\n]*Audio:", t)))
 
 
 def _even(x: float) -> int:
@@ -58,7 +85,7 @@ def _scale_for(info: Info, vkbps: float) -> Optional[str]:
 
 def _encode(src: Path, dst: Path, info: Info, vkbps: int, cb: Progress, label: str) -> None:
     vf = _scale_for(info, vkbps)
-    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostats",
+    cmd = [ff.ffmpeg(), "-y", "-hide_banner", "-loglevel", "error", "-nostats",
            "-i", str(src),
            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
            "-b:v", f"{vkbps}k", "-maxrate", f"{int(vkbps * 1.25)}k",
@@ -165,7 +192,7 @@ def _via_pillow(src: Path, tmp: Path) -> None:
 
 
 def _via_ffmpeg(src: Path, tmp: Path) -> None:
-    r = subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(src),
+    r = subprocess.run([ff.ffmpeg(), "-y", "-hide_banner", "-loglevel", "error", "-i", str(src),
                         "-vf", f"scale='min({PHOTO_MAX_SIDE},iw)':-2", "-frames:v", "1",
                         "-update", "1", "-q:v", "2", "-f", "image2", "-c:v", "mjpeg", str(tmp)],
                        capture_output=True, text=True, timeout=60)

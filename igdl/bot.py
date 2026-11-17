@@ -5,7 +5,6 @@ import asyncio
 import json
 import logging
 import os
-import shutil
 import sqlite3
 import time
 from contextlib import ExitStack
@@ -463,8 +462,9 @@ def main():
         raise SystemExit("BOT_TOKEN belum diisi di .env")
     if not ALLOWED:
         log.warning("ALLOWED_CHAT_IDS kosong — bot terbuka untuk SEMUA orang")
-    if not shutil.which("ffmpeg"):
-        log.warning("ffmpeg tidak ditemukan — kompresi video akan gagal")
+    from . import ff
+    if not (ff.BIN / "ffmpeg").exists():
+        log.warning("ffmpeg belum diuji/dipilih — jalankan ./install.sh (python -m igdl.ff)")
 
     app = (Application.builder().token(token)
            .connect_timeout(30).read_timeout(120).write_timeout(300)

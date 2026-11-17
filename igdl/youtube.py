@@ -23,6 +23,7 @@ from typing import Callable, Optional
 from urllib.parse import parse_qs, urlparse
 
 from .core import BASE, MEDIA_CACHE, IGError, _short
+from . import ff
 from .media import MB, probe
 
 Progress = Callable[[str, Optional[float], str], None]
@@ -78,6 +79,8 @@ def _opts(**extra) -> dict:
          "socket_timeout": 20, "retries": 3, "fragment_retries": 5, "noplaylist": True}
     deno = BASE / "bin" / "deno"
     o["js_runtimes"] = {"deno": {"path": str(deno)}} if deno.is_file() else {"deno": {}}
+    if loc := ff.location():                       # the tested ffmpeg (see igdl.ff)
+        o["ffmpeg_location"] = loc
     if (ck := os.environ.get("YT_COOKIES", "").strip()) and Path(ck).expanduser().is_file():
         o["cookiefile"] = str(Path(ck).expanduser())
     o.update(extra)
@@ -234,7 +237,7 @@ def split(path: Path, limit: int = PART_LIMIT, cb: Progress = _noop) -> list[Pat
         for old in path.parent.glob(f"{path.stem}_part*{path.suffix}"):
             old.unlink()
         cb("potong", None, f"jadi ±{math.ceil(dur / seg)} bagian (tanpa encode ulang)")
-        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(path),
+        cmd = [ff.ffmpeg(), "-y", "-hide_banner", "-loglevel", "error", "-i", str(path),
                "-map", "0", "-c", "copy", "-f", "segment", "-segment_time", f"{seg:.2f}",
                "-reset_timestamps", "1"]
         if path.suffix == ".mp4":

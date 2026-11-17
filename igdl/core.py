@@ -273,6 +273,9 @@ def _via_yt_dlp(t: Target, dest: Path, cb: Progress) -> list[Path]:
     }
     if ck := _cookies():
         opts["cookiefile"] = str(Path(ck).expanduser())
+    from . import ff
+    if loc := ff.location():
+        opts["ffmpeg_location"] = loc
     cb("yt-dlp", None, "mencoba jalur cadangan")
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:

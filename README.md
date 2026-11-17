@@ -171,6 +171,17 @@ memperbarui igdl kalau Instagram mengganti query-nya.
 `gallery-dl` versi sekarang memakai REST API yang tanpa login hampir selalu dialihkan ke halaman
 login; ia tetap ada di rantai untuk dipakai bersama cookies. `yt-dlp` hanya mengambil video.
 
+## ffmpeg yang dipakai
+
+`install.sh` menguji setiap ffmpeg yang ada (ffmpeg sistem dulu, lalu ffmpeg statis bawaan
+`imageio-ffmpeg`) dengan operasi yang benar-benar dipakai igdl — membuat mp3, jpg, mp4 H.264+AAC,
+dan memotong video — lalu menautkan yang lolos ke `~/igdl/bin/ffmpeg`. ffmpeg sistem tidak diubah.
+Build ffmpeg yang dipangkas (mis. tanpa muxer mp3/image2) otomatis dilewati. Cek ulang kapan saja:
+
+```bash
+cd ~/igdl && venv/bin/python -m igdl.ff
+```
+
 ## Perawatan
 
 Instagram dan YouTube sering mengubah sistemnya. Kalau unduhan mulai gagal, jalankan ulang installer:

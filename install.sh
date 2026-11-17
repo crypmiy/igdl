@@ -4,7 +4,7 @@ set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 RUN_USER="${USER:-$(id -un)}"
 cd "$DIR"
-step() { printf '\n\033[1;36m[%s/7] %s\033[0m\n' "$1" "$2"; }
+step() { printf '\n\033[1;36m[%s/8] %s\033[0m\n' "$1" "$2"; }
 
 step 1 "cek ffmpeg & python3-venv"
 missing=()
@@ -57,16 +57,19 @@ PY
   fi
 fi
 
-step 5 ".env & folder data"
+step 5 "uji ffmpeg (mp3 · jpg · mp4 · potong) → pilih yang lolos"
+IGDL_HOME="$DIR" venv/bin/python -m igdl.ff || echo "  peringatan: lihat daftar di atas"
+
+step 6 ".env & folder data"
 mkdir -p data
 if [ ! -f .env ]; then cp .env.example .env; chmod 600 .env; echo "  .env dibuat — isi BOT_TOKEN"; else echo "  .env sudah ada (tidak diubah)"; fi
 
-step 6 "perintah igdl di PATH"
+step 7 "perintah igdl di PATH"
 mkdir -p "$HOME/.local/bin"
 ln -sf "$DIR/venv/bin/igdl" "$HOME/.local/bin/igdl"
 case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) echo '  catatan: tambahkan ~/.local/bin ke PATH (atau buka terminal baru)';; esac
 
-step 7 "systemd service igdl-bot"
+step 8 "systemd service igdl-bot"
 sed -e "s|@USER@|$RUN_USER|g" -e "s|@DIR@|$DIR|g" igdl-bot.service.in \
   | sudo tee /etc/systemd/system/igdl-bot.service >/dev/null
 sudo systemctl daemon-reload
