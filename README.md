@@ -1,15 +1,21 @@
 # igdl
 
-Unduh foto dan video Instagram dari link — lewat **command line** atau **bot Telegram**. Tanpa login.
+Unduh foto dan video Instagram, Threads, dan YouTube dari link — lewat **command line** atau **bot Telegram**. Tanpa login.
 
 Dibuat untuk berjalan di server kecil (dikembangkan di Jetson Orin Nano, aarch64), tapi jalan di Linux mana pun yang punya Python ≥ 3.10 dan ffmpeg.
 
 ## Fitur
 
 - **Post foto, carousel, reel, dan video** — semua item carousel diunduh berurutan.
+- **Post Threads** (`threads.com` / `threads.net`, termasuk link pendek `/t/KODE` dan link bagikan `/share/…`) — foto, video, dan carousel dari post yang di-link **plus lanjutan utas oleh penulisnya**; teks post ikut sebagai caption di bot dan sebagai `KODE_caption.txt` di CLI.
 - **Per akun.** `@username` atau link profil → post terbaru tanpa login (±12, batas Instagram untuk pengunjung tanpa akun). Riwayat lengkap (post + reels) lewat CLI `--all` dengan cookies akun cadangan.
 - **Tanpa login untuk semua yang lain.** Story dan highlight ditolak dengan pesan yang jelas karena Instagram mewajibkan login untuk itu.
 - **Empat jalur unduh berlapis**: GraphQL tanpa login → `gallery-dl` → `yt-dlp` → halaman embed. Kalau satu gagal, jalur berikutnya dicoba otomatis.
+- **YouTube** — video, Shorts, dan playlist lewat `yt-dlp` + Deno (dipasang otomatis oleh `install.sh`).
+  CLI menyimpan kualitas terbaik s/d 1080p (mp4) atau `--audio` (mp3). Di bot, video yang melebihi
+  50 MB memunculkan tombol: **video ≤50 MB** (resolusi yang muat, tanpa encode ulang), **kualitas
+  penuh dibagi beberapa bagian** (maks. 20 bagian), atau **audio MP3**.
+- **Link `/share/…`** (Instagram maupun Threads) diurai otomatis ke post aslinya; hasilnya disimpan di `data/share_links.json`.
 - **Cache di disk**: hasil unduhan disimpan di `data/media/<shortcode>/` dan dipakai ulang; link yang sama tidak diunduh lagi.
 - **Bot Telegram**
   - Paste link, bot membalas dengan medianya; carousel dikirim sebagai album (maks. 10 per album).
@@ -63,7 +69,26 @@ igdl https://www.instagram.com/p/XXXXXXXXXXX/          # simpan ke ~/Downloads/i
 igdl LINK1 LINK2 -o ~/ig                               # banyak link, folder lain
 igdl -i links.txt                                      # daftar link dari file
 igdl -i links.txt --fit 49                             # kompres video > 49 MB
+igdl https://www.threads.com/@akun/post/XXXXXXXXXXX    # post Threads (+ lanjutan utas penulis)
 ```
+
+**Threads — apa yang ikut:** post yang di-link, post berikutnya dari penulis yang sama di utas itu,
+dan (kalau post-nya adalah post utama) utas balasan yang diawali penulisnya. Tidak ikut: post
+induk di atasnya, balasan orang lain, post yang dikutip/di-repost, dan "post lainnya" di halaman.
+Post yang hanya berisi teks dibalas dengan pesan yang jelas.
+
+### YouTube
+
+```bash
+igdl https://youtu.be/XXXXXXXXXXX                 # mp4 terbaik s/d 1080p
+igdl https://youtu.be/XXXXXXXXXXX --res 720       # batasi resolusi
+igdl https://youtu.be/XXXXXXXXXXX --audio         # mp3 128 kbps
+igdl "https://www.youtube.com/playlist?list=PL…"  # semua video playlist → folder sendiri
+igdl "https://www.youtube.com/playlist?list=PL…" -n 5 --audio
+```
+
+Nama file: `Judul [ID].mp4`. Video dengan batas umur, khusus member, atau private dibalas dengan
+pesan yang jelas (butuh login YouTube, belum didukung). Siaran langsung belum bisa diunduh.
 
 ### Per akun
 
@@ -111,6 +136,12 @@ CLI menyimpan kualitas asli; kompresi hanya dilakukan bila diberi `--fit`. Path 
 
 Setelah itu cukup paste satu atau beberapa link Instagram dalam satu pesan.
 
+**YouTube di bot:** paste link video → bot membalas judul + durasi. Kalau muat satu file ≤50 MB
+langsung dikirim; kalau tidak, pilih lewat tombol. Tiap bagian dikirim sebagai pesan sendiri
+("Bagian 2/6"), audio sebagai file musik. Link playlist → N video pertama (default 5, mis.
+`LINK_PLAYLIST 3`), masing-masing otomatis (utuh kalau muat, kalau tidak versi ≤50 MB). Batas
+durasi di bot 3 jam per video (`YT_MAX_MINUTES`); yang lebih panjang lewat CLI.
+
 **Per akun di bot:** kirim `@natgeo` atau link profil → bot mengirim post terbaru satu per satu
 (default 12, ubah lewat angka: `@natgeo 5`, maks. 50). Unduhan post berikutnya berjalan sambil
 post sebelumnya dikirim, dan bot otomatis menunggu bila kena batas flood Telegram. Riwayat
@@ -123,6 +154,9 @@ lengkap sengaja hanya lewat CLI.
 | `BOT_TOKEN` | — | Token dari @BotFather (wajib untuk bot). |
 | `ALLOWED_CHAT_IDS` | kosong | Chat ID yang boleh memakai bot, dipisah koma. **Kosong = terbuka untuk semua orang.** |
 | `MAX_JOBS` | `1` | Jumlah unduhan paralel. Kompresi memakai CPU, jadi 1 sudah cukup di perangkat kecil. |
+| `YT_MAX_MINUTES` | `180` | Batas durasi video YouTube di bot. |
+| `YT_PLAYLIST_N` | `5` | Jumlah video pertama yang dikirim bot untuk link playlist (maks. 20). |
+| `YT_COOKIES` | kosong | Opsional: `cookies.txt` YouTube (untuk video dengan batas umur / verifikasi "bukan bot"). |
 | `PROFILE_N` | `12` | Jumlah post terbaru yang dikirim bot untuk `@akun`. |
 | `IG_COOKIES` | kosong | Opsional: path `cookies.txt` akun cadangan (format Netscape). Dipakai untuk `igdl @akun --all` dan sebagai cadangan gallery-dl. Kosong = tanpa login. |
 
@@ -139,10 +173,10 @@ login; ia tetap ada di rantai untuk dipakai bersama cookies. `yt-dlp` hanya meng
 
 ## Perawatan
 
-Instagram sering mengubah sistemnya. Kalau unduhan mulai gagal, perbarui extractor-nya:
+Instagram dan YouTube sering mengubah sistemnya. Kalau unduhan mulai gagal, jalankan ulang installer:
 
 ```bash
-~/igdl/venv/bin/pip install -U gallery-dl yt-dlp && sudo systemctl restart igdl-bot
+cd ~/igdl && ./install.sh          # selalu memperbarui yt-dlp + gallery-dl ke versi terbaru
 ```
 
 Cache media bisa dihapus kapan saja bila disk penuh:
@@ -173,6 +207,9 @@ igdl/
 │   ├── core.py      # klasifikasi link, cache, rantai unduh
 │   ├── graphql.py   # jalur GraphQL tanpa login (curl_cffi)
 │   ├── profile.py   # unduhan per akun (daftar post + unduh satu per satu)
+│   ├── threads.py   # post Threads tanpa login (halaman post → embed)
+│   ├── youtube.py   # YouTube: info, pilih format, unduh, potong, mp3, playlist
+│   ├── ytbot.py     # YouTube di bot: tombol pilihan, kirim per bagian
 │   ├── media.py     # ffprobe/ffmpeg: kompres video, normalisasi foto
 │   ├── cli.py       # perintah `igdl`
 │   └── bot.py       # perintah `igdl-bot` (Telegram)

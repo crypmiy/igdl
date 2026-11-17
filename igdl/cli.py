@@ -1,9 +1,13 @@
 """igdl — download Instagram posts/reels/carousels, or a whole account, from the command line.
 
-  igdl LINK [LINK…]          post / reel / carousel
+  igdl LINK [LINK…]          post / reel / carousel Instagram, atau post Threads
   igdl @akun                 12 post terbaru akun (tanpa login)
   igdl @akun -n 5            5 post terbaru
   igdl @akun --all           semua post + reels (butuh IG_COOKIES akun cadangan)
+  igdl LINK_YOUTUBE          video/Shorts YouTube, kualitas terbaik s/d 1080p (mp4)
+  igdl LINK_YOUTUBE --audio  audio saja (mp3 128 kbps)
+  igdl LINK_YOUTUBE --res 720
+  igdl LINK_PLAYLIST [-n 5]  semua video playlist (atau N pertama)
 """
 from __future__ import annotations
 
@@ -16,7 +20,7 @@ from typing import Optional
 
 from . import __version__
 from . import profile as prof
-from .core import IGError, classify, download, find_profiles, find_urls, is_video
+from .core import IGError, classify, download, find_profiles, find_urls, is_video, read_caption
 from .media import MB, fit_video
 
 
@@ -60,6 +64,9 @@ def main(argv=None) -> int:
     ap.add_argument("-i", "--input", help="file berisi daftar link (satu per baris)")
     ap.add_argument("-o", "--out", default=str(Path.home() / "Downloads" / "igdl"),
                     help="folder hasil (default: ~/Downloads/igdl)")
+    ap.add_argument("--audio", action="store_true", help="YouTube: audio saja (mp3)")
+    ap.add_argument("--res", type=int, metavar="TINGGI", default=None,
+                    help="YouTube: batas resolusi, mis. 720 (default 1080)")
     ap.add_argument("--fit", type=float, metavar="MB",
                     help="kompres video yang lebih besar dari MB (mis. --fit 49)")
     ap.add_argument("-V", "--version", action="version", version=f"igdl {__version__}")
@@ -82,6 +89,10 @@ def main(argv=None) -> int:
         prefix = f"[{i}/{len(urls)}]"
         bar = Bar(prefix)
         t = classify(url)
+        if t.kind in ("youtube", "ytplaylist"):
+            good = _youtube(t, a, out, prefix)
+            ok, fail = ok + good, fail + (not good)
+            continue
         if t.kind == "profile":
             good = _account(t.code, a, out)
             ok, fail = ok + good, fail + (not good)
@@ -98,6 +109,9 @@ def main(argv=None) -> int:
                 dst = out / name
                 shutil.copy2(f, dst)
                 saved.append(dst)
+            if t.kind == "threads" and (txt := read_caption(t)):
+                cap = out / f"{t.code}_caption.txt"
+                cap.write_text(txt, encoding="utf-8")
             size = sum(p.stat().st_size for p in saved) / MB
             bar.done(f"{prefix} ✓ {t.code or url}: {len(saved)} file, {size:.1f} MB "
                      f"via {method} ({time.monotonic() - bar.t0:.1f}s)")
@@ -170,6 +184,51 @@ def _account(username: str, a, out: Path) -> bool:
                      f"{stats['fail']} gagal, {stats['files']} file, {stats['mb']:.0f} MB, "
                      f"{_fmt(time.monotonic() - t0)} → {dst_dir}\n")
     return stats["ok"] > 0
+
+
+def _yt_one(vid: str, a, dst_dir: Path, bar: "Bar", prefix: str) -> bool:
+    from . import youtube as yt
+    try:
+        inf = yt.info(vid)
+        mode = "audio" if a.audio else "full"
+        files, method = yt.download(vid, mode, bar, max_height=a.res or yt.MAX_HEIGHT)
+        f = files[0]
+        if a.fit and mode == "full":
+            f = fit_video(f, int(a.fit * MB), bar)
+        dst = dst_dir / yt.safe_name(inf["title"], vid, f.suffix)
+        if not (dst.exists() and dst.stat().st_size == f.stat().st_size):
+            shutil.copy2(f, dst)
+        bar.done(f"{prefix} ✓ {inf['title'][:60]} · {yt.fmt_dur(inf['duration'])} · "
+                 f"{dst.stat().st_size / MB:.1f} MB via {method} ({time.monotonic() - bar.t0:.0f}s)")
+        print(dst)
+        return True
+    except IGError as e:
+        bar.done(f"{prefix} ✗ {vid}\n    {e}")
+    except Exception as e:
+        bar.done(f"{prefix} ✗ {vid}\n    {type(e).__name__}: {e}")
+    return False
+
+
+def _youtube(t, a, out: Path, prefix: str) -> bool:
+    from . import youtube as yt
+    if t.kind == "youtube":
+        return _yt_one(t.code, a, out, Bar(prefix), prefix)
+    try:
+        title, entries = yt.playlist(t.code, a.latest)
+    except IGError as e:
+        sys.stderr.write(f"{prefix} ✗ playlist {t.code}\n    {e}\n")
+        return False
+    dst_dir = out / yt.safe_name(title, t.code, "")
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    sys.stderr.write(f"playlist \"{title}\": {len(entries)} video → {dst_dir}\n")
+    t0, good = time.monotonic(), 0
+    for i, (vid, _) in enumerate(entries, 1):
+        el = time.monotonic() - t0
+        eta = f" ETA {_fmt(el / (i - 1) * (len(entries) - i + 1))}" if i > 1 else ""
+        p = f"  [{i}/{len(entries)}{eta}]"
+        good += _yt_one(vid, a, dst_dir, Bar(p), p)
+    sys.stderr.write(f"playlist selesai: {good}/{len(entries)} video, {_fmt(time.monotonic() - t0)}\n")
+    return good > 0
 
 
 def _fmt(sec: float) -> str:

@@ -1,4 +1,4 @@
-"""igdl-bot — Telegram bot: send an Instagram link, get the photos/videos back."""
+"""igdl-bot — Telegram bot: send an Instagram, Threads or YouTube link, get the media back."""
 from __future__ import annotations
 
 import asyncio
@@ -11,19 +11,23 @@ import time
 from contextlib import ExitStack
 from pathlib import Path
 
+# python-telegram-bot ≥ 22.2: opt in to timedelta durations (RetryAfter.retry_after etc.);
+# the int form is deprecated and warns. _secs() below accepts both.
+os.environ.setdefault("PTB_TIMEDELTA", "1")
+
 from telegram import (InputMediaDocument, InputMediaPhoto, InputMediaVideo,
                       LinkPreviewOptions, Message, Update)
 from telegram.constants import ChatAction
-from telegram.error import BadRequest, RetryAfter
-from telegram.ext import (Application, CommandHandler, ContextTypes, MessageHandler,
-                          filters)
+from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
+from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
+                          MessageHandler, filters)
 
 from . import __version__
 import re
 
 from . import profile as prof
 from .core import (IGError, Target, classify, download, find_profiles, find_urls, is_video,
-                   precheck)
+                   precheck, read_caption)
 from .media import MB, TG_PHOTO_LIMIT, TG_VIDEO_LIMIT, fit_video, normalise_photo, video_meta
 
 log = logging.getLogger("igdl")
@@ -38,11 +42,14 @@ NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 EDIT_EVERY = 2.0          # seconds between progress edits (Telegram flood limits)
 
 HELP = ("Kirim link Instagram, nanti saya balas dengan foto/videonya.\n\n"
-        "Didukung (tanpa login): post foto, carousel, reel, video.\n"
+        "Didukung (tanpa login): post foto, carousel, reel, video, dan post Threads\n"
+        "(threads.com / threads.net, termasuk lanjutan utas dari penulisnya).\n"
         "Akun: kirim @username atau link profil → post terbaru "
         f"(default {PROFILE_N}; mis. \"@natgeo 5\").\n"
+        "YouTube: video, Shorts, playlist (mis. \"LINK_PLAYLIST 5\"). Video yang melebihi\n"
+        "50 MB → tombol pilihan: video ≤50 MB · kualitas penuh dibagi · audio MP3.\n"
         "Tidak didukung: story, highlight (butuh login).\n"
-        "Video > 50 MB dikompres otomatis.\n"
+        "Video Instagram/Threads > 50 MB dikompres otomatis.\n"
         "Hasil unduhan disimpan di disk, link yang sama tidak diunduh ulang.")
 
 
@@ -95,7 +102,10 @@ class Status:
     async def _loop(self):
         while True:
             await asyncio.sleep(EDIT_EVERY)
-            await self.flush()
+            try:
+                await self.flush()
+            except Exception:                     # keep the ticker alive whatever happens
+                log.debug("status flush gagal", exc_info=True)
 
     async def flush(self, final: str | None = None):
         txt = f"{self.title}\n{final or self.text}"
@@ -106,7 +116,7 @@ class Status:
             self.shown = txt
         except RetryAfter as e:
             await asyncio.sleep(_secs(e.retry_after))
-        except BadRequest:
+        except (BadRequest, NetworkError):        # TimedOut is a NetworkError; status is cosmetic
             pass
 
     def start(self):
@@ -118,6 +128,19 @@ class Status:
 
 
 # ------------------------------------------------------------------ sending
+CAPTION_MAX = 1024          # Telegram media caption limit
+
+
+def _caption(t: Target) -> str:
+    link = f"📥 {t.url}"
+    txt = read_caption(t) if t.kind == "threads" else ""
+    if not txt:
+        return link
+    room = CAPTION_MAX - len(link) - 8               # "\n\n" + "  ⚡" + safety
+    if len(txt) > room:
+        txt = txt[:room - 1].rstrip() + "…"
+    return f"{txt}\n\n{link}"
+
 def _secs(ra) -> float:
     return ra.total_seconds() if hasattr(ra, "total_seconds") else float(ra)
 
@@ -141,6 +164,8 @@ def _file_id(m: Message) -> tuple[str, str]:
         return "photo", m.photo[-1].file_id
     if m.animation:
         return "video", m.animation.file_id
+    if m.audio:
+        return "audio", m.audio.file_id
     if m.document:
         return "document", m.document.file_id
     raise ValueError("pesan tanpa media")
@@ -154,36 +179,63 @@ def _input_media(kind: str, media, caption=None, **meta):
     return InputMediaDocument(media, caption=caption)
 
 
+UPLOAD_TIMEOUTS = {"connect_timeout": 30, "pool_timeout": 60,
+                   "write_timeout": 900,     # per write op; slow home uplink
+                   "read_timeout": 600}      # Telegram can take minutes to process big videos
+ALBUM_MAX_BYTES = 48 * MB                     # one request at a time stays small and reliable
+
+
+def _size(media) -> int:
+    try:
+        return os.fstat(media.fileno()).st_size
+    except (AttributeError, OSError, ValueError):
+        return 0                              # file_id: nothing to upload
+
+
+def _chunks(items):
+    """Albums of ≤ 10 items and ≤ ALBUM_MAX_BYTES of uploads each."""
+    chunk, size = [], 0
+    for it in items:
+        sz = _size(it[1])
+        if chunk and (len(chunk) == 10 or size + sz > ALBUM_MAX_BYTES):
+            yield chunk
+            chunk, size = [], 0
+        chunk.append(it)
+        size += sz
+    if chunk:
+        yield chunk
+
+
 async def _send(bot, chat_id: int, reply_to: int, items, caption: str):
-    """items: list of (kind, media, meta). Albums of ≤10; documents sent apart
-    (Telegram cannot mix documents with photos/videos in one album)."""
+    """items: list of (kind, media, meta). Albums of ≤10 (and ≤48 MB per request);
+    documents sent apart (Telegram cannot mix documents with photos/videos)."""
     sent: list[tuple[str, str]] = []
     groupable = [it for it in items if it[0] in ("photo", "video")]
     docs = [it for it in items if it[0] == "document"]
     first = True
 
-    for i in range(0, len(groupable), 10):
-        chunk = groupable[i:i + 10]
+    for chunk in _chunks(groupable):
         cap = caption if first else None
         if len(chunk) == 1:
             kind, media, meta = chunk[0]
             if kind == "photo":
                 m = await bot.send_photo(chat_id, media, caption=cap,
-                                         reply_to_message_id=reply_to)
+                                         reply_to_message_id=reply_to, **UPLOAD_TIMEOUTS)
             else:
                 m = await bot.send_video(chat_id, media, caption=cap,
                                          supports_streaming=True,
-                                         reply_to_message_id=reply_to, **meta)
+                                         reply_to_message_id=reply_to, **meta, **UPLOAD_TIMEOUTS)
             sent.append(_file_id(m))
         else:
             group = [_input_media(k, md, cap if j == 0 else None, **mt)
                      for j, (k, md, mt) in enumerate(chunk)]
-            msgs = await bot.send_media_group(chat_id, group, reply_to_message_id=reply_to)
+            msgs = await bot.send_media_group(chat_id, group, reply_to_message_id=reply_to,
+                                              **UPLOAD_TIMEOUTS)
             sent += [_file_id(m) for m in msgs]
         first = False
     for kind, media, _ in docs:
         m = await bot.send_document(chat_id, media, caption=caption if first else None,
-                                    reply_to_message_id=reply_to)
+                                    reply_to_message_id=reply_to, **UPLOAD_TIMEOUTS)
         sent.append(_file_id(m))
         first = False
     return sent
@@ -238,10 +290,15 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await msg.reply_text(HELP)
     m = re.search(r"\b(\d{1,3})\b", re.sub(r"https?://\S+|@\S+", " ", text))
     n = min(int(m.group(1)), PROFILE_MAX) if m else PROFILE_N
+    from . import ytbot
     for url in urls:
         t = await asyncio.to_thread(classify, url)
         if t.kind == "profile":
             users.append(t.code)
+        elif t.kind == "youtube":
+            await ytbot.handle_link(ctx, msg, t.code)
+        elif t.kind == "ytplaylist":
+            await ytbot.handle_playlist(ctx, msg, t.code, int(m.group(1)) if m else ytbot.PLAYLIST_N)
         else:
             await process(ctx, msg, url)
     for u in dict.fromkeys(users):
@@ -253,7 +310,7 @@ async def process(ctx: ContextTypes.DEFAULT_TYPE, msg: Message, url: str):
     cache: Cache = app.bot_data["cache"]
     sem: asyncio.Semaphore = app.bot_data["sem"]
     t: Target = await asyncio.to_thread(classify, url)
-    caption = f"📥 {t.url}"
+    caption = _caption(t)
 
     if reason := precheck(t):
         return await msg.reply_text(f"❌ {reason}")
@@ -270,15 +327,20 @@ async def process(ctx: ContextTypes.DEFAULT_TYPE, msg: Message, url: str):
         f"🔗 {t.code or url}\n⏳ antre…" if sem.locked() else f"🔗 {t.code or url}\n⏳ mulai…",
         link_preview_options=NO_PREVIEW)
     st = Status(status_msg, f"🔗 {t.code or url}")
+    total = 0.0
     async with sem:
         st.start()
         try:
             files, method = await asyncio.to_thread(download, t, None, st.update)
+            caption = _caption(t)                       # Threads text is known only now
             ready = await asyncio.to_thread(_prepare, files, st)
             total = sum(p.stat().st_size for _, p, _ in ready) / MB
             st.update("mengirim ke Telegram", None, f"{len(ready)} file, {total:.1f} MB")
             await st.flush()
-            await ctx.bot.send_chat_action(msg.chat_id, ChatAction.UPLOAD_DOCUMENT)
+            try:
+                await ctx.bot.send_chat_action(msg.chat_id, ChatAction.UPLOAD_DOCUMENT)
+            except NetworkError:
+                pass
             with ExitStack() as stack:
                 items = [(k, stack.enter_context(open(p, "rb")), meta) for k, p, meta in ready]
                 sent = await _send_safe(ctx.bot, msg.chat_id, msg.message_id, items, caption)
@@ -293,6 +355,12 @@ async def process(ctx: ContextTypes.DEFAULT_TYPE, msg: Message, url: str):
         except IGError as e:
             st.stop()
             await st.flush(f"❌ {e}")
+        except TimedOut:
+            st.stop()
+            log.warning("upload timeout %s (%.1f MB)", url, total)
+            await st.flush("⚠️ Telegram kehabisan waktu saat upload (koneksi upload lambat atau server sibuk). "
+                "File bisa saja tetap muncul sebentar lagi; kalau tidak, kirim ulang link-nya — "
+                "unduhannya sudah tersimpan, jadi tidak diunduh ulang.")
         except Exception as e:
             st.stop()
             log.exception("gagal %s", url)
@@ -356,6 +424,10 @@ async def process_profile(ctx: ContextTypes.DEFAULT_TYPE, msg: Message, username
                 sent_posts += 1
                 files_total += k
                 from_cache += cached
+            except TimedOut:
+                failed += 1
+                log.warning("upload timeout %s", r.code)
+                errors.append(f"{r.code}: Telegram timeout saat upload (mungkin tetap terkirim)")
             except Exception as e:
                 failed += 1
                 log.exception("kirim %s gagal", r.code)
@@ -396,11 +468,13 @@ def main():
 
     app = (Application.builder().token(token)
            .connect_timeout(30).read_timeout(120).write_timeout(300)
-           .media_write_timeout(600).pool_timeout(30)
+           .media_write_timeout(900).pool_timeout(60)
            .concurrent_updates(True).build())
     app.bot_data["cache"] = Cache(DATA / "cache.sqlite")
     app.bot_data["sem"] = asyncio.Semaphore(MAX_JOBS)
+    from . import ytbot
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
+    app.add_handler(CallbackQueryHandler(ytbot.on_callback, pattern=r"^yt\|"))
     app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, on_text))
     log.info("igdl-bot %s jalan (whitelist: %s, max jobs: %d)",
              __version__, sorted(ALLOWED) or "TIDAK ADA", MAX_JOBS)

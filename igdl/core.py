@@ -28,7 +28,8 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/128.0 Safari/537.36")
 
 IG_URL_RE = re.compile(
-    r"https?://(?:www\.|m\.)?(?:instagram\.com|instagr\.am)/[^\s<>\"']+", re.I)
+    r"https?://(?:www\.|m\.)?(?:instagram\.com|instagr\.am|threads\.com|threads\.net|(?:music\.)?youtube\.com|youtu\.be)/[^\s<>\"']+",
+    re.I)
 MEDIA_EXT = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".mp4", ".mov", ".webm", ".m4v"}
 VIDEO_EXT = {".mp4", ".mov", ".webm", ".m4v"}
 
@@ -78,24 +79,94 @@ def find_urls(text: str) -> list[str]:
     return out
 
 
+POST_URL_RE = re.compile(
+    r"https?://(?:www\.)?(?:threads\.(?:com|net)/(?:@[\w.]+/post|t)/[\w-]+"
+    r"|instagram\.com/(?:[\w.]+/)?(?:p|reel|reels|tv)/[\w-]+)", re.I)
+SHARE_CACHE = BASE / "data" / "share_links.json"
+
+
+def _share_target(page: str) -> Optional[str]:
+    """Post URL named by a share page: canonical / og:url / meta refresh / first post link."""
+    for pat in (r'<link[^>]+rel="canonical"[^>]+href="([^"]+)"',
+                r'<meta[^>]+property="og:url"[^>]+content="([^"]+)"',
+                r'<meta[^>]+http-equiv="refresh"[^>]+content="[^"]*url=([^"]+)"'):
+        if (m := re.search(pat, page, re.I)) and POST_URL_RE.search(html.unescape(m.group(1))):
+            return POST_URL_RE.search(html.unescape(m.group(1))).group(0)
+    # app deep links name the post explicitly (barcelona:// = Threads, instagram:// = IG)
+    for scheme, base in (("barcelona", "https://www.threads.com/t/"),
+                         ("instagram", "https://www.instagram.com/p/")):
+        m = re.search(r'<meta[^>]+property="al:(?:ios|android):url"[^>]+content="'
+                      + scheme + r'://[^"]*?shortcode=([\w-]+)', page, re.I)
+        if m:
+            return base + m.group(1)
+    return None
+
+
 def _resolve_share(url: str) -> str:
-    """instagram.com/share/... links are redirects; follow them (best effort)."""
+    """/share/... links (Instagram and Threads) are redirects to the real post.
+    Follows them with a browser-like session; results are cached on disk."""
     try:
-        req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": UA})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            return r.geturl()
+        cache = json.loads(SHARE_CACHE.read_text()) if SHARE_CACHE.is_file() else {}
+    except ValueError:
+        cache = {}
+    if url in cache:
+        return cache[url]
+    found = None
+    try:
+        from . import threads
+        r = threads.session().get(url, timeout=20, allow_redirects=True)
+        final = str(r.url)
+        if "/share/" not in final and POST_URL_RE.search(final):
+            found = final
+        else:
+            found = _share_target(r.text or "")
     except Exception:
-        return url
+        pass
+    if not found:
+        try:
+            req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                if "/share/" not in r.geturl() and POST_URL_RE.search(r.geturl()):
+                    found = r.geturl()
+        except Exception:
+            pass
+    if found:
+        try:
+            SHARE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            cache[url] = found
+            SHARE_CACHE.write_text(json.dumps(cache, indent=0))
+        except OSError:
+            pass
+        return found
+    return url
+
+
+def _classify_threads(url: str, parts: list[str]) -> Target:
+    # /@user/post/CODE  ·  /t/CODE (short link)  ·  /share/XXXX (redirect)
+    if parts and parts[0] == "share":
+        resolved = _resolve_share(url)
+        return classify(resolved) if resolved != url else Target(url, "share")
+    if len(parts) >= 3 and parts[0].startswith("@") and parts[1] == "post":
+        return Target(f"https://www.threads.com/{parts[0]}/post/{parts[2]}", "threads", parts[2])
+    if len(parts) >= 2 and parts[0] == "t":
+        return Target(f"https://www.threads.com/t/{parts[1]}", "threads", parts[1])
+    return Target(url, "unknown")
 
 
 def classify(url: str) -> Target:
     p = urlparse(url)
     parts = [s for s in p.path.split("/") if s]
+    from . import youtube                               # lazy: youtube imports core
+    if yt := youtube.parse(url):
+        kind, ident = yt
+        if kind == "video":
+            return Target(youtube.watch_url(ident), "youtube", ident)
+        return Target(f"https://www.youtube.com/playlist?list={ident}", "ytplaylist", ident)
+    if re.search(r"(?:^|\.)threads\.(?:com|net)$", p.netloc, re.I):
+        return _classify_threads(url, parts)
     if parts and parts[0] == "share":
         resolved = _resolve_share(url)
-        if resolved != url and "/share/" not in resolved:
-            return classify(resolved)
-        return Target(url, "unknown")
+        return classify(resolved) if resolved != url else Target(url, "share")
     if not parts:
         return Target(url, "unknown")
     if parts[0] == "stories":
@@ -293,13 +364,26 @@ def precheck(t: Target) -> Optional[str]:
                 "Kirim link post (/p/…), reel (/reel/…), atau profil (@username).")
     if t.kind == "profile":
         return "Ini link profil — pakai unduhan per akun."
+    if t.kind in ("youtube", "ytplaylist"):
+        return "Ini link YouTube — ditangani modul youtube."
+    if t.kind == "share":
+        return ("Link /share/ ini tidak bisa diurai menjadi post (mungkin dialihkan ke halaman "
+                "login). Buka link-nya di aplikasi, lalu Bagikan → Salin link dan kirim link itu.")
     if t.kind == "unknown":
-        return "Link tidak dikenali sebagai post atau reel Instagram."
+        return "Link tidak dikenali sebagai post/reel Instagram atau post Threads."
     return None
 
 
 def cache_dir(t: Target) -> Path:
+    if t.kind == "threads":
+        return MEDIA_CACHE / f"threads_{t.code}"
     return MEDIA_CACHE / (t.code or re.sub(r"[^A-Za-z0-9_-]+", "_", t.url)[-80:])
+
+
+def read_caption(t: Target) -> str:
+    """Post text saved next to the media (Threads), or ''."""
+    f = cache_dir(t) / "caption.txt"
+    return f.read_text(encoding="utf-8") if f.is_file() else ""
 
 
 def _short(msg: str) -> str:
@@ -317,8 +401,19 @@ def _short(msg: str) -> str:
     return line[:160]
 
 
+def _via_threads(t: Target, dest: Path, cb: Progress) -> list[Path]:
+    from . import threads
+    return threads.download_page(t.url, t.code, dest, cb)
+
+
+def _via_threads_embed(t: Target, dest: Path, cb: Progress) -> list[Path]:
+    from . import threads
+    return threads.download_embed(t.url, t.code, dest, cb)
+
+
 STAGES = (("graphql", _via_graphql), ("gallery-dl", _via_gallery_dl),
           ("yt-dlp", _via_yt_dlp), ("embed", _via_embed))
+THREADS_STAGES = (("threads", _via_threads), ("threads-embed", _via_threads_embed))
 
 
 def download(t: Target, dest: Optional[Path] = None,
@@ -337,7 +432,7 @@ def download(t: Target, dest: Optional[Path] = None,
         return files, "cache"
     errors: list[tuple[str, str]] = []
     gated = False
-    for name, fn in STAGES:
+    for name, fn in (THREADS_STAGES if t.kind == "threads" else STAGES):
         for f in dest.iterdir():          # clean leftovers from a failed stage
             if f.is_file():
                 f.unlink()
@@ -356,6 +451,8 @@ def download(t: Target, dest: Optional[Path] = None,
         head = "Jetson tidak bisa menghubungi Instagram (jaringan/DNS). Cek koneksi lalu coba lagi."
     elif gated:
         head = "Post ini tidak bisa dibuka tanpa login (private, dibatasi umur, atau dihapus)."
+    elif any("hanya teks" in m for _, m in errors):
+        head = "Post Threads ini hanya berisi teks — tidak ada foto/video untuk diunduh."
     elif any(h in m.lower() for _, m in errors for h in RATE_HINTS):
         head = "Instagram sedang membatasi akses tanpa login dari IP ini. Coba lagi beberapa menit lagi."
     else:

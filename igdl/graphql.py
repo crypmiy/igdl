@@ -192,12 +192,18 @@ def download(code: str, dest: Path, cb: Progress) -> list[Path]:
     items = media_items(fetch_product(code))
     if not items:
         raise RuntimeError("post tidak berisi media")
-    s = _session()["s"]
+    return fetch_files(_session()["s"], items, dest, code, cb, STAGE, ROOT + "/")
+
+
+def fetch_files(s, items: list[tuple[str, str]], dest: Path, code: str, cb: Progress,
+                stage: str, referer: str) -> list[Path]:
+    """Stream [(url, ext)] into dest as NN_code.ext (atomic .part writes, progress)."""
+    STAGE = stage                                       # noqa: N806 — label for cb()
     n, files = len(items), []
     for i, (url, ext) in enumerate(items, 1):
         dst = dest / f"{i:02d}_{code}{ext}"
         part = dst.with_name(dst.name + ".part")
-        r = s.get(url, stream=True, timeout=60, headers={"Referer": ROOT + "/"})
+        r = s.get(url, stream=True, timeout=60, headers={"Referer": referer})
         try:
             if r.status_code != 200:
                 raise RuntimeError(f"HTTP {r.status_code} saat mengunduh file {i}/{n}")
